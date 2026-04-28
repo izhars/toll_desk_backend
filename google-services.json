@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "42010922468",
+    "project_id": "tollplaza-61b44",
+    "storage_bucket": "tollplaza-61b44.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:42010922468:android:dec727bd31089f3e21cbf1",
+        "android_client_info": {
+          "package_name": "com.toll_plaza.toll_plaza"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBN0m4Vv6_dRUzUSwp5Jml7gtqz0ARNbSE"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
