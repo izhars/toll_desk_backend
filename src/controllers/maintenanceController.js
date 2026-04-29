@@ -5,7 +5,7 @@ const User = require('../models/User');
 const NotificationService = require('../services/notificationService');
 const path = require('path');
 const fs = require('fs');
-const {deleteFromCloudinary } = require('../middleware/upload');
+const { deleteFromCloudinary } = require('../middleware/upload');
 const generateReportId = require('../utils/generateReportId');
 const { REPORT_STATUS, USER_ROLES, ERROR_MESSAGES } = require('../utils/constants');
 const { sendAssignmentEmail } = require('../utils/emailService');
@@ -483,6 +483,7 @@ exports.assignReport = async (req, res) => {
     const notes = req.body.notes;
     const reassignmentReason = req.body.reassignmentReason;
     const sendEmail = req.body.sendEmail !== false;
+    const sendEmailToOtherSupervisors = req.body.sendEmailToOtherSupervisors !== false; // New flag
 
     // Fetch assignees
     const assignees = await User.find({
@@ -524,7 +525,7 @@ exports.assignReport = async (req, res) => {
       if (isSelfAssignment) {
         // CRITICAL: Atomic check and update for self-assignment
         console.log(`[ASSIGN_REPORT] Attempting atomic self-assignment for supervisor ${requesterId}`);
-        
+
         // Use findOneAndUpdate with condition to prevent race conditions
         const updatedReport = await TollMaintenanceReport.findOneAndUpdate(
           {
@@ -560,20 +561,20 @@ exports.assignReport = async (req, res) => {
           if (!existingReport) {
             return res.status(404).json({ success: false, message: ERROR_MESSAGES.NOT_FOUND });
           }
-          
+
           // If already assigned to another supervisor, prevent self-assignment
           if (existingReport.assignedTo && existingReport.assignedTo.length > 0) {
-            const assignedToNames = await User.find({ 
-              _id: { $in: existingReport.assignedTo } 
+            const assignedToNames = await User.find({
+              _id: { $in: existingReport.assignedTo }
             }).select('name');
-            
+
             return res.status(409).json({
               success: false,
               message: `Cannot self-assign. Report is already assigned to: ${assignedToNames.map(u => u.name).join(', ')}`,
               code: 'ALREADY_ASSIGNED'
             });
           }
-          
+
           return res.status(500).json({
             success: false,
             message: 'Failed to assign report due to concurrent update'
@@ -586,19 +587,9 @@ exports.assignReport = async (req, res) => {
         await updatedReport.populate('reportedBy', 'name email');
         await updatedReport.populate('timeline.changedBy', 'name email');
 
-        // Send notifications
-        if (sendEmail) {
-          await sendAssignmentEmail({
-            report: updatedReport,
-            assignee: req.user,
-            assignedBy: req.user,
-            isReassignment: false,
-            notes: notes
-          });
-        }
+        // DO NOT send email for self-assignment
+        console.log(`[ASSIGN_REPORT] Self-assignment successful for ${req.user.name} - No email sent`);
 
-        console.log(`[ASSIGN_REPORT] Self-assignment successful for ${req.user.name}`);
-        
         return res.json({
           success: true,
           message: 'Report assigned to you successfully',
@@ -625,23 +616,29 @@ exports.assignReport = async (req, res) => {
     }
 
     // For ADMIN or SUPERVISOR assigning to others (non-self)
-    // Use atomic update to prevent race conditions
     console.log(`[ASSIGN_REPORT] Performing atomic assignment to multiple assignees`);
-    
+
     // First, get current state to detect if this is a reassignment
     const currentReport = await TollMaintenanceReport.findById(reportId);
     if (!currentReport) {
       return res.status(404).json({ success: false, message: ERROR_MESSAGES.NOT_FOUND });
     }
-    
+
     const originalStatus = currentReport.status;
     const originalAssignees = [...(currentReport.assignedTo || [])];
-    
-    // Calculate new assignees
-    const newAssignees = assigneeIds.filter(
+
+    // Calculate new assignees (exclude self if current user is a supervisor)
+    let newAssignees = assigneeIds.filter(
       id => !originalAssignees.some(existingId => existingId.toString() === id.toString())
     );
-    
+
+    // If supervisor is assigning to others, filter out self from newAssignees to avoid duplicate processing
+    if (requesterRole === USER_ROLES.SUPERVISOR) {
+      newAssignees = newAssignees.filter(
+        id => id.toString() !== requesterId.toString()
+      );
+    }
+
     if (newAssignees.length === 0) {
       // Already assigned to all requested users
       return res.json({
@@ -650,20 +647,20 @@ exports.assignReport = async (req, res) => {
         data: currentReport
       });
     }
-    
+
     const isReassignment = originalStatus === REPORT_STATUS.ASSIGNED && newAssignees.length > 0;
-    
+
     // Build update object
     const updateObject = {
       $addToSet: { assignedTo: { $each: assigneeIds } }, // Add without duplicates
       $set: {}
     };
-    
+
     // Update status if needed
     if (originalStatus !== REPORT_STATUS.ASSIGNED) {
       updateObject.$set.status = REPORT_STATUS.ASSIGNED;
     }
-    
+
     // Add reassignment details if needed
     if (isReassignment && reassignmentReason) {
       updateObject.$set.reassignmentDetails = {
@@ -674,21 +671,21 @@ exports.assignReport = async (req, res) => {
         notes: notes || ''
       };
     }
-    
-    // Add timeline entries for new assignees
+
+    // Add timeline entries for new assignees only
     const timelineEntries = [];
     for (const assigneeId of newAssignees) {
       const assignee = assignees.find(a => a._id.toString() === assigneeId.toString());
+      if (!assignee) continue;
+
       let timelineNote;
-      
-      if (assigneeId.toString() === requesterId.toString()) {
-        timelineNote = `Assigned to self by ${req.user.name}`;
-      } else if (isReassignment) {
+
+      if (isReassignment) {
         timelineNote = `Reassigned to ${assignee.name} by ${req.user.name}${reassignmentReason ? ` - Reason: ${reassignmentReason}` : ''}`;
       } else {
         timelineNote = notes || `Assigned to ${assignee.name}`;
       }
-      
+
       timelineEntries.push({
         status: REPORT_STATUS.ASSIGNED,
         changedBy: requesterId,
@@ -696,47 +693,77 @@ exports.assignReport = async (req, res) => {
         notes: timelineNote
       });
     }
-    
+
     if (timelineEntries.length > 0) {
       updateObject.$push = { timeline: { $each: timelineEntries } };
     }
-    
+
     // Perform atomic update
     const updatedReport = await TollMaintenanceReport.findOneAndUpdate(
       { _id: reportId },
       updateObject,
       { new: true } // Return updated document
     );
-    
+
     if (!updatedReport) {
       return res.status(500).json({
         success: false,
         message: 'Failed to update report'
       });
     }
-    
+
     // Populate for response
     await updatedReport.populate('plazaId', 'name location');
     await updatedReport.populate('assignedTo', 'name email role');
     await updatedReport.populate('reportedBy', 'name email');
     await updatedReport.populate('timeline.changedBy', 'name email');
-    
-    // Send notifications for new assignees only
+
+    // Send notifications based on flags
     let notificationsSent = 0;
     let emailsSent = 0;
-    
+
+    // Determine if we should send emails based on role and flags
+    const shouldSendEmails = () => {
+      // If global sendEmail flag is false, don't send any emails
+      if (!sendEmail) return false;
+
+      // If sendEmailToOtherSupervisors is false, don't send emails
+      if (!sendEmailToOtherSupervisors) return false;
+
+      // For admin, respect the flag
+      if (requesterRole === USER_ROLES.ADMIN) {
+        return sendEmailToOtherSupervisors;
+      }
+
+      // For supervisor assigning to others, respect the flag
+      if (requesterRole === USER_ROLES.SUPERVISOR) {
+        return sendEmailToOtherSupervisors;
+      }
+
+      return false;
+    };
+
+    const emailsEnabled = shouldSendEmails();
+
+    console.log(`[ASSIGN_REPORT] Email settings: sendEmail=${sendEmail}, sendEmailToOtherSupervisors=${sendEmailToOtherSupervisors}, emailsEnabled=${emailsEnabled}`);
+
     for (const assigneeId of newAssignees) {
+      // Skip if it's self-assignment
       if (assigneeId.toString() === requesterId.toString()) {
+        console.log(`[ASSIGN_REPORT] Skipping email for self-assignment to ${assigneeId}`);
         continue;
       }
-      
+
       const assignee = assignees.find(a => a._id.toString() === assigneeId.toString());
-      
+      if (!assignee) continue;
+
       try {
+        // Always send in-app notification
         await NotificationService.sendAssignmentNotification(updatedReport, assignee, req.user);
         notificationsSent++;
-        
-        if (sendEmail) {
+
+        // Send email ONLY if explicitly enabled
+        if (emailsEnabled) {
           await sendAssignmentEmail({
             report: updatedReport,
             assignee,
@@ -746,21 +773,29 @@ exports.assignReport = async (req, res) => {
             notes: notes
           });
           emailsSent++;
+          console.log(`[ASSIGN_REPORT] Email sent to ${assignee.email} (enabled=${emailsEnabled})`);
+        } else {
+          console.log(`[ASSIGN_REPORT] Email SKIPPED for ${assignee.email} - sendEmail=${sendEmail}, sendEmailToOtherSupervisors=${sendEmailToOtherSupervisors}`);
         }
       } catch (error) {
         console.error(`Failed to send notification to ${assignee.email}:`, error);
       }
     }
-    
+
     const responseTime = Date.now() - startTime;
-    console.log(`[ASSIGN_REPORT] Assignment completed in ${responseTime}ms`);
-    
+    console.log(`[ASSIGN_REPORT] Assignment completed in ${responseTime}ms - Emails sent: ${emailsSent}/${newAssignees.length}, Notifications sent: ${notificationsSent}`);
+
     res.json({
       success: true,
       message: `Report ${isReassignment ? 'reassigned' : 'assigned'} to ${newAssignees.length} new user(s) successfully`,
-      data: updatedReport
+      data: updatedReport,
+      meta: {
+        emailsSent,
+        notificationsSent,
+        totalAssignees: newAssignees.length
+      }
     });
-    
+
   } catch (error) {
     console.error(`[ASSIGN_REPORT] Error:`, error);
     res.status(500).json({
@@ -769,7 +804,6 @@ exports.assignReport = async (req, res) => {
     });
   }
 };
-
 
 // @desc    Unassign a user from a report
 // @route   PUT /api/toll-maintenance/reports/:id/unassign
@@ -834,13 +868,13 @@ exports.unassignUser = async (req, res) => {
     // Authorization check
     const isAdmin = requesterRole === USER_ROLES.ADMIN;
     const isSupervisor = requesterRole === USER_ROLES.SUPERVISOR;
-    
+
     // Check if supervisor is authorized to unassign
     if (isSupervisor) {
       const isRequesterAssigned = currentAssignees.some(
         assignee => assignee._id.toString() === requesterId.toString()
       );
-      
+
       if (!isRequesterAssigned) {
         return res.status(403).json({
           success: false,
@@ -882,11 +916,11 @@ exports.unassignUser = async (req, res) => {
     // If no assignees left, revert status to OPEN
     let statusChanged = false;
     const previousStatus = report.status;
-    
+
     if (report.assignedTo.length === 0) {
       report.status = REPORT_STATUS.OPEN;
       statusChanged = true;
-      
+
       await exports.addTimelineEntry(
         report,
         REPORT_STATUS.OPEN,
@@ -927,25 +961,25 @@ exports.unassignUser = async (req, res) => {
     // Emit real-time updates via Socket.io
     if (global.io) {
       const recipientIds = new Set();
-      
+
       // Add unassigned users
       unassignedUsers.forEach(user => recipientIds.add(user._id.toString()));
-      
+
       // Add remaining assignees
       if (report.assignedTo && report.assignedTo.length > 0) {
         report.assignedTo.forEach(assignee => {
           if (assignee._id) recipientIds.add(assignee._id.toString());
         });
       }
-      
+
       // Add reporter
       if (report.reportedBy && report.reportedBy._id) {
         recipientIds.add(report.reportedBy._id.toString());
       }
-      
+
       // Exclude requester
       recipientIds.delete(requesterId);
-      
+
       recipientIds.forEach(recipientId => {
         global.io.to(`user_${recipientId}`).emit('user_unassigned', {
           reportId: report._id,
@@ -2542,7 +2576,7 @@ const getTeamWorkloadData = async (plazaId = null, dateRange = null) => {
     ]);
 
     // Sort workload by totalReports (highest first)
-    const sortedWorkload = [...workload].sort((a, b) => 
+    const sortedWorkload = [...workload].sort((a, b) =>
       (b.totalReports || 0) - (a.totalReports || 0)
     );
 
@@ -2750,7 +2784,7 @@ exports.getSupervisorDashboardData = async (userId, dateRanges) => {
 
   try {
     // ==================== FIXED PLAZA PERFORMANCE QUERY ====================
-    
+
     // Option 1: Try with direct ObjectId matching (MOST LIKELY TO WORK)
     let plazasWithStats = await TollPlaza.aggregate([
       {
@@ -2939,7 +2973,7 @@ exports.getSupervisorDashboardData = async (userId, dateRanges) => {
     }
 
     // ==================== CONTINUE WITH OTHER DASHBOARD DATA ====================
-    
+
     // Plaza Performance (limit to top 10)
     const plazaPerformance = plazasWithStats.slice(0, 10);
 
